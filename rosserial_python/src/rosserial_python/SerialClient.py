@@ -44,6 +44,7 @@ import struct
 import sys
 import threading
 import time
+from contextlib import contextmanager
 
 from serial import Serial, SerialException, SerialTimeoutException
 
@@ -86,6 +87,16 @@ def load_service(package,service):
     mreq = getattr(s, service+"Request")
     mres = getattr(s, service+"Response")
     return srv,mreq,mres
+
+@contextmanager
+def acquire_timeout(lock, timeout):
+    result = lock.acquire(timeout=timeout)
+    try:
+        yield result
+    finally:
+        if result:
+            lock.release()
+
 
 class Publisher:
     """
@@ -250,6 +261,7 @@ class RosSerialServer:
             #now do something with the clientsocket
             rospy.loginfo("Established a socket connection from %s on port %s" % address)
             self.socket = clientsocket
+            self.socket.settimeout(5.0)
             self.isConnected = True
 
             if self.fork_server: # if configured to launch server in a separate process
@@ -267,8 +279,8 @@ class RosSerialServer:
         client = SerialClient(self)
         try:
             client.run()
-        except KeyboardInterrupt:
-            pass
+        except KeyboardInterrupt as e:
+            rospy.loginfo(f"{e}")
         except RuntimeError:
             rospy.loginfo("RuntimeError exception caught")
             self.isConnected = False
@@ -480,15 +492,14 @@ class SerialClient(object):
             # an IOError if there's a serial problem or timeout. In that scenario, a single handler at the
             # bottom attempts to reconfigure the topics.
             try:
-                res = self.read_lock.acquire(timeout=1)
-                if res:
-                    is_empty = self.port.inWaiting() < 1
-                    self.read_lock.release()
-                    if is_empty:
-                        time.sleep(0.001)
+                with acquire_timeout(self.read_lock, 1) as res:
+                    if res:
+                        is_empty = self.port.inWaiting() < 1
+                        if is_empty:
+                            time.sleep(0.001)
+                            continue
+                    else:
                         continue
-                else:
-                    continue
 
                 # Find sync flag.
                 flag = [0, 0]
@@ -564,15 +575,13 @@ class SerialClient(object):
                 rospy.logwarn('Run loop error: %s' % exc)
                 # One of the read calls had an issue. Just to be safe, request that the client
                 # reinitialize their topics.
-                res = self.read_lock.acquire(timeout=1)
-                if res:
-                    self.port.flushInput()
-                    self.read_lock.release()
+                with acquire_timeout(self.read_lock, 1) as res:
+                    if res:
+                        self.port.flushInput()
 
-                res = self.write_lock.acquire(timeout=1)
-                if res:
-                    self.port.flushOutput()
-                    self.write_lock.release()
+                with acquire_timeout(self.write_lock, 1) as res:
+                    if res:
+                        self.port.flushOutput()
                     
                 self.requestTopics()
         self.write_thread.join()
@@ -594,10 +603,11 @@ class SerialClient(object):
             msg.deserialize(data)
             pub = Publisher(msg)
             if msg.topic_id not in self.publishers:
-                self.publishers[msg.topic_id] = pub
-                self.callbacks[msg.topic_id] = pub.handlePacket
-                self.setPublishSize(msg.buffer_size)
                 rospy.loginfo("Setup publisher on %s [%s]" % (msg.topic_name, msg.message_type) )
+            self.publishers[msg.topic_id] = pub
+            self.callbacks[msg.topic_id] = pub.handlePacket
+            self.setPublishSize(msg.buffer_size)
+            
         except Exception as e:
             rospy.logerr("Creation of publisher failed: %s", e)
 
@@ -738,6 +748,9 @@ class SerialClient(object):
             resp.floats =param
         if t == str:
             resp.strings = param
+
+        rospy.loginfo('Requesting param %s'%req.name)
+        
         data_buffer = io.BytesIO()
         resp.serialize(data_buffer)
         self.send(TopicInfo.ID_PARAMETER_REQUEST, data_buffer.getvalue())
