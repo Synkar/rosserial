@@ -721,36 +721,45 @@ class SerialClient(object):
         req = RequestParamRequest()
         req.deserialize(data)
         resp = RequestParamResponse()
+
+        resp.name = req.name
+        param_exists = False
         try:
             param = rospy.get_param(req.name)
+            if param is not None:
+                param_exists = True
+                
         except KeyError:
+            pass
+
+        if param_exists:
+            if isinstance(param, dict):
+                rospy.logerr("Cannot send param %s because it is a dictionary"%req.name)
+            else:
+                if not isinstance(param, list):
+                    param = [param]
+
+                #check to make sure that all parameters in list are same type
+                t = type(param[0])
+                for p in param:
+                    if t!= type(p):
+                        rospy.logerr('All Parameters in the list %s must be of the same type'%req.name)
+                        break
+                else:
+                    if t == int or t == bool:
+                        resp.ints = param
+                    if t == float:
+                        resp.floats =param
+                    if t == str:
+                        resp.strings = param
+
+
+                    resp.exists = True
+                    rospy.loginfo('Requesting param %s'%req.name)
+                    
+        else:
             rospy.logerr("Parameter %s does not exist"%req.name)
-            return
 
-        if param is None:
-            rospy.logerr("Parameter %s does not exist"%req.name)
-            return
-
-        if isinstance(param, dict):
-            rospy.logerr("Cannot send param %s because it is a dictionary"%req.name)
-            return
-        if not isinstance(param, list):
-            param = [param]
-        #check to make sure that all parameters in list are same type
-        t = type(param[0])
-        for p in param:
-            if t!= type(p):
-                rospy.logerr('All Paramers in the list %s must be of the same type'%req.name)
-                return
-        if t == int or t == bool:
-            resp.ints = param
-        if t == float:
-            resp.floats =param
-        if t == str:
-            resp.strings = param
-
-        rospy.loginfo('Requesting param %s'%req.name)
-        
         data_buffer = io.BytesIO()
         resp.serialize(data_buffer)
         self.send(TopicInfo.ID_PARAMETER_REQUEST, data_buffer.getvalue())
