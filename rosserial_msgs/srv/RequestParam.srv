@@ -2,6 +2,8 @@ string name
 
 ---
 
+string name
+bool exists
 int32[]   ints
 float32[] floats
 string[]  strings
