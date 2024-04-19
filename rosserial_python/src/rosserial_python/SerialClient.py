@@ -116,9 +116,12 @@ class Publisher:
 
     def handlePacket(self, data):
         """ Forward message to ROS network. """
-        m = self.message()
-        m.deserialize(data)
-        self.publisher.publish(m)
+        try:
+            m = self.message()
+            m.deserialize(data)
+            self.publisher.publish(m)
+        except Exception as e:
+            rospy.logerr("Publisher handling packet failed: %s", e)
 
 
 class Subscriber:
@@ -186,9 +189,12 @@ class ServiceServer:
 
     def handlePacket(self, data):
         """ Forward response to ROS network. """
-        r = self.mres()
-        r.deserialize(data)
-        self.response = r
+        try:
+            r = self.mres()
+            r.deserialize(data)
+            self.response = r
+        except Exception as e:
+            rospy.logerr("Service server handling packet failed: %s", e)
 
 
 class ServiceClient:
@@ -213,14 +219,18 @@ class ServiceClient:
 
     def handlePacket(self, data):
         """ Forward request to ROS network. """
-        req = self.mreq()
-        req.deserialize(data)
-        # call service proxy
-        resp = self.proxy(req)
-        # serialize and publish
-        data_buffer = io.BytesIO()
-        resp.serialize(data_buffer)
-        self.parent.send(self.id, data_buffer.getvalue())
+        try:
+            req = self.mreq()
+            req.deserialize(data)
+            # call service proxy
+            resp = self.proxy(req)
+            # serialize and publish
+            data_buffer = io.BytesIO()
+            resp.serialize(data_buffer)
+            self.parent.send(self.id, data_buffer.getvalue())
+        except Exception as e:
+            rospy.logerr("Service client handling packet failed: %s", e)
+
 
 class RosSerialServer:
     """
@@ -718,9 +728,13 @@ class SerialClient(object):
 
     def handleParameterRequest(self, data):
         """ Send parameters to device. Supports only simple datatypes and arrays of such. """
-        req = RequestParamRequest()
-        req.deserialize(data)
-        resp = RequestParamResponse()
+        try:
+            req = RequestParamRequest()
+            req.deserialize(data)
+            resp = RequestParamResponse()
+        except Exception as e:
+            rospy.logerr("Handle Parameter Request failed: %s", e)
+            return
 
         resp.name = req.name
         param_exists = False
@@ -766,18 +780,21 @@ class SerialClient(object):
 
     def handleLoggingRequest(self, data):
         """ Forward logging information from serial device into ROS. """
-        msg = Log()
-        msg.deserialize(data)
-        if msg.level == Log.ROSDEBUG:
-            rospy.logdebug(msg.msg)
-        elif msg.level == Log.INFO:
-            rospy.loginfo(msg.msg)
-        elif msg.level == Log.WARN:
-            rospy.logwarn(msg.msg)
-        elif msg.level == Log.ERROR:
-            rospy.logerr(msg.msg)
-        elif msg.level == Log.FATAL:
-            rospy.logfatal(msg.msg)
+        try:
+            msg = Log()
+            msg.deserialize(data)
+            if msg.level == Log.ROSDEBUG:
+                rospy.logdebug(msg.msg)
+            elif msg.level == Log.INFO:
+                rospy.loginfo(msg.msg)
+            elif msg.level == Log.WARN:
+                rospy.logwarn(msg.msg)
+            elif msg.level == Log.ERROR:
+                rospy.logerr(msg.msg)
+            elif msg.level == Log.FATAL:
+                rospy.logfatal(msg.msg)
+        except Exception as e:
+            rospy.logerr("Handling Logging Request failed: %s", e)
 
     def send(self, topic, msg):
         """
