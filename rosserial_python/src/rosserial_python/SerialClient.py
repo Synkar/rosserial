@@ -440,7 +440,10 @@ class SerialClient(object):
         # TODO remove if possible
         if not self.fix_pyserial_for_test:
             with self.read_lock:
-                self.port.flushInput()
+                try:
+                    self.port.flushInput()
+                except AttributeError: # socket doesn't have flushInput
+                    pass
 
         # request topic sync
         self.write_queue.put(self.header + self.protocol_ver + b"\x00\x00\xff\x00\x00\xff")
@@ -449,7 +452,10 @@ class SerialClient(object):
         """ Send stop tx request to client before the node exits. """
         if not self.fix_pyserial_for_test:
             with self.read_lock:
-                self.port.flushInput()
+                try:
+                    self.port.flushInput()
+                except AttributeError: # socket doesn't have flushInput
+                    pass
 
         self.write_queue.put(self.header + self.protocol_ver + b"\x00\x00\xff\x0b\x00\xf4")
         rospy.loginfo("Sending tx stop request")
@@ -587,11 +593,17 @@ class SerialClient(object):
                 # reinitialize their topics.
                 with acquire_timeout(self.read_lock, 1) as res:
                     if res:
-                        self.port.flushInput()
+                        try:
+                            self.port.flushInput()
+                        except AttributeError: # socket doesn't have flushInput
+                            pass
 
                 with acquire_timeout(self.write_lock, 1) as res:
                     if res:
-                        self.port.flushOutput()
+                        try:
+                            self.port.flushOutput()
+                        except AttributeError: # socket doesn't have flushOutput
+                            pass
                     
                 self.requestTopics()
         self.write_thread.join()
