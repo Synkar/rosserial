@@ -404,6 +404,8 @@ class RosSerialServerUDP:
                     self.startSerialClient()
                     rospy.loginfo("startSerialClient() exited")
             except socket.timeout:
+                self.isConnected = False
+                self.client_address = None
                 continue
 
     def startSerialClient(self):
@@ -415,6 +417,7 @@ class RosSerialServerUDP:
         except RuntimeError:
             rospy.loginfo("RuntimeError exception caught")
             self.isConnected = False
+            self.client_address = None
         finally:
             rospy.loginfo("Client has exited.")
 
@@ -439,22 +442,33 @@ class RosSerialServerUDP:
             chunk = data[offset:offset + chunk_size]
             
             try:
-                # Send the chunk
+                # Send the chunk to the stored client address
                 self.serversocket.sendto(chunk, self.client_address)
                 offset += chunk_size
             except BrokenPipeError:
                 raise RuntimeError("RosSerialServerUDP.write() socket connection broken")
 
     def read(self, rqsted_length):
-        self.msg = b''
-        if not self.isConnected:
-            return self.msg
+        self.msg = b''  # Buffer to accumulate the received message
+
+        if not self.isConnected or self.client_address is None:
+            return self.msg  # Return an empty message if not connected
 
         while len(self.msg) < rqsted_length:
-            chunk, address = self.serversocket.recvfrom(rqsted_length - len(self.msg))
-            if chunk == b'':
-                raise RuntimeError("RosSerialServerUDP.read() socket connection broken")
-            self.msg = self.msg + chunk
+            try:
+                chunk, address = self.serversocket.recvfrom(4096)
+
+                # Check if the connection is broken
+                if chunk == b'':
+                    raise RuntimeError("RosSerialServer.read() socket connection broken")
+
+                # Only receive data from the stored client address
+                if address == self.client_address:
+                    # Append the chunk to the message
+                    self.msg += chunk
+                else:
+                    rospy.loginfo(f"Ignoring packet from unauthorized address {address}")
+
         return self.msg
 
     def inWaiting(self):
