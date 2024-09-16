@@ -472,8 +472,9 @@ class RosSerialUDPServer:
             
             # Check if data is coming from the client address
             if address != self.client_address:
+                # If data comes from the same IP but different port, update the client_address
                 if address[0] == self.client_address[0]:
-                    rospy.logwan(f"Updating client address from {self.client_address} to {address}")
+                    rospy.logwarn(f"Updating client address from {self.client_address} to {address}")
                     self.client_address = address
                 else:
                     rospy.loginfo(f"Ignoring packet from unauthorized address {address}")
@@ -492,12 +493,24 @@ class RosSerialUDPServer:
 
     def inWaiting(self):
         try:
-            chunk, address = self.serversocket.recvfrom(1, socket.MSG_DONTWAIT|socket.MSG_PEEK)
+            chunk, address = self.serversocket.recvfrom(4096, socket.MSG_DONTWAIT)
             if chunk == b'':
                 raise RuntimeError("RosSerialServerUDP.inWaiting() socket connection broken")
-            return len(chunk)
+
+            # Check if data is coming from the client address
+            if address != self.client_address:
+                # If data comes from the same IP but different port, update the client_address
+                if address[0] == self.client_address[0]:
+                    rospy.logwarn(f"Updating client address from {self.client_address} to {address}")
+                    self.client_address = address
+                else:
+                    rospy.loginfo(f"Ignoring packet from unauthorized address {address}")
+
+            self.recv_buffer += chunk
         except BlockingIOError:
-            return 0
+            pass
+
+        return len(self.recv_buffer)
 
 
 class SerialClient(object):
