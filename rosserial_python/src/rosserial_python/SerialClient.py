@@ -60,7 +60,7 @@ ERROR_MISMATCHED_PROTOCOL = "Mismatched protocol version in packet: lost sync or
 ERROR_NO_SYNC = "no sync with device"
 ERROR_PACKET_FAILED = "Packet Failed : Failed to read msg data"
 
-MAX_UDP_PACKET_SIZE = 1400  # Set a size smaller than MTU to account for headers
+MAX_UDP_PACKET_SIZE = 508
 
 def load_pkg_module(package, directory):
     #check if its in the python path
@@ -348,9 +348,9 @@ class RosSerialServer:
         except BlockingIOError:
             return 0
 
-class RosSerialServerUDP:
+class RosSerialUDPServer:
     """
-        RosSerialServerUDP waits for a UDP packet then passes itself to SerialClient, which
+        RosSerialUDPServer waits for a UDP packet then passes itself to SerialClient, which
         uses it as a serial port. It listens for additional packets. Each process proxies ROS
         operations (e.g. publish/subscribe) from its connection to the rest of ROS.
     """
@@ -358,6 +358,7 @@ class RosSerialServerUDP:
         rospy.loginfo("Fork_server is: %s" % fork_server)
         self.udp_portnum = udp_portnum
         self.fork_server = fork_server
+        self.recv_buffer  = b'' # Buffer to store leftover data from packets
 
     def listen(self):
         self.serversocket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -454,20 +455,38 @@ class RosSerialServerUDP:
         if not self.isConnected or self.client_address is None:
             return self.msg  # Return an empty message if not connected
 
+        # First, try to use any leftover data in the internal buffer
+        if self.recv_buffer:
+            # Calculate how much data can be used from the buffer
+            to_read = min(len(self.recv_buffer), rqsted_length)
+            self.msg += self.recv_buffer[:to_read]
+            self.recv_buffer = self.recv_buffer[to_read:]
+
         while len(self.msg) < rqsted_length:
-            try:
-                chunk, address = self.serversocket.recvfrom(4096)
+            chunk, address = self.serversocket.recvfrom(4096)
 
-                # Check if the connection is broken
-                if chunk == b'':
-                    raise RuntimeError("RosSerialServer.read() socket connection broken")
+            # Check if the connection is broken
+            if chunk == b'':
+                raise RuntimeError("RosSerialServer.read() socket connection broken")
 
-                # Only receive data from the stored client address
-                if address == self.client_address:
-                    # Append the chunk to the message
-                    self.msg += chunk
+            
+            # Check if data is coming from the client address
+            if address != self.client_address:
+                if address[0] == self.client_address[0]:
+                    rospy.logwan(f"Updating client address from {self.client_address} to {address}")
+                    self.client_address = address
                 else:
                     rospy.loginfo(f"Ignoring packet from unauthorized address {address}")
+                    continue
+
+            
+            # Determine how much of the chunk can be added to `self.msg`
+            to_add = rqsted_length - len(self.msg)
+            self.msg += chunk[:to_add]
+
+            # Store any remaining data from the chunk in the internal buffer
+            if len(chunk) > to_add:
+                self.recv_buffer += chunk[to_add:]
 
         return self.msg
 

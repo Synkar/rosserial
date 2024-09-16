@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 #####################################################################
 # Software License Agreement (BSD License)
@@ -79,7 +79,7 @@ if __name__=="__main__":
                 process.terminate()
                 process.join()
             rospy.loginfo("All done")
-    elif port_name == "ucp" :
+    elif port_name == "udp" :
         server = RosSerialUDPServer(tcp_portnum, fork_server)
         rospy.loginfo("Waiting for socket connections on port %d" % tcp_portnum)
         try:
