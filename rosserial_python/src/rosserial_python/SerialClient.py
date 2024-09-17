@@ -428,7 +428,7 @@ class RosSerialUDPServer:
         self.startSerialClient()
 
     def flushInput(self):
-        pass
+        self.recv_buffer  = b''
 
     def write(self, data):
         if not self.isConnected or self.client_address is None:
@@ -756,23 +756,7 @@ class SerialClient(object):
             except IOError as exc:
                 rospy.logwarn('Last read step: %s' % read_step)
                 rospy.logwarn('Run loop error: %s' % exc)
-                # One of the read calls had an issue. Just to be safe, request that the client
-                # reinitialize their topics.
-                with acquire_timeout(self.read_lock, 1) as res:
-                    if res:
-                        try:
-                            self.port.flushInput()
-                        except AttributeError: # socket doesn't have flushInput
-                            pass
-
-                with acquire_timeout(self.write_lock, 1) as res:
-                    if res:
-                        try:
-                            self.port.flushOutput()
-                        except AttributeError: # socket doesn't have flushOutput
-                            pass
-                    
-                self.requestTopics()
+                return
         self.write_thread.join()
 
     def setPublishSize(self, size):
