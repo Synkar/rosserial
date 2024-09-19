@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 #####################################################################
 # Software License Agreement (BSD License)
@@ -36,7 +36,7 @@
 __author__ = "mferguson@willowgarage.com (Michael Ferguson)"
 
 import rospy
-from rosserial_python import SerialClient, RosSerialServer
+from rosserial_python import SerialClient, RosSerialServer, RosSerialUDPServer
 from serial import SerialException
 from time import sleep
 import multiprocessing
@@ -67,6 +67,20 @@ if __name__=="__main__":
 
     if port_name == "tcp" :
         server = RosSerialServer(tcp_portnum, fork_server)
+        rospy.loginfo("Waiting for socket connections on port %d" % tcp_portnum)
+        try:
+            server.listen()
+        except KeyboardInterrupt:
+            rospy.loginfo("got keyboard interrupt")
+        finally:
+            rospy.loginfo("Shutting down")
+            for process in multiprocessing.active_children():
+                rospy.loginfo("Shutting down process %r", process)
+                process.terminate()
+                process.join()
+            rospy.loginfo("All done")
+    elif port_name == "udp" :
+        server = RosSerialUDPServer(tcp_portnum, fork_server)
         rospy.loginfo("Waiting for socket connections on port %d" % tcp_portnum)
         try:
             server.listen()

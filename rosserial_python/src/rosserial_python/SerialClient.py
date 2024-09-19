@@ -60,6 +60,8 @@ ERROR_MISMATCHED_PROTOCOL = "Mismatched protocol version in packet: lost sync or
 ERROR_NO_SYNC = "no sync with device"
 ERROR_PACKET_FAILED = "Packet Failed : Failed to read msg data"
 
+MAX_UDP_PACKET_SIZE = 508
+
 def load_pkg_module(package, directory):
     #check if its in the python path
     path = sys.path
@@ -346,6 +348,171 @@ class RosSerialServer:
         except BlockingIOError:
             return 0
 
+class RosSerialUDPServer:
+    """
+        RosSerialUDPServer waits for a UDP packet then passes itself to SerialClient, which
+        uses it as a serial port. It listens for additional packets. Each process proxies ROS
+        operations (e.g. publish/subscribe) from its connection to the rest of ROS.
+    """
+    def __init__(self, udp_portnum, fork_server=False):
+        rospy.loginfo("Fork_server is: %s" % fork_server)
+        self.udp_portnum = udp_portnum
+        self.fork_server = fork_server
+        self.recv_buffer  = b'' # Buffer to store leftover data from packets
+
+    def listen(self):
+        self.serversocket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.serversocket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # Get buffer size
+        rospy.loginfo("Getting socket buffer size")
+        bufsize = self.serversocket.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
+        rospy.loginfo("Socket buffer size: %d bytes" % bufsize)
+        # Increase socket buffer size to 500KB
+        self.serversocket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 512000)
+        newbufsize = self.serversocket.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
+        rospy.loginfo("New Socket buffer size: %d bytes" % newbufsize)
+        # Bind the socket to a public host and a well-known port
+        self.serversocket.bind(("", self.udp_portnum))  # become a UDP server socket
+        rospy.loginfo("UDP server listening on port %d" % self.udp_portnum)
+
+        # Set socket timeout
+        self.serversocket.settimeout(5)
+
+        self.isConnected = False
+
+        self.client_address = None
+
+        # Listen for UDP packets
+        while not rospy.is_shutdown():
+            try:
+                # Check if there is data to be received 
+                data, address = self.serversocket.recvfrom(1, socket.MSG_PEEK)
+
+                # If this is the first connection, store the address
+                if self.client_address is None:
+                    self.client_address = address
+                    rospy.loginfo(f"Client connected from {self.client_address}")
+                    self.isConnected = True
+
+                if self.fork_server:  # If configured to launch server in a separate process
+                    rospy.loginfo("Forking a socket server process")
+                    process = multiprocessing.Process(target=self.startSocketServer, args=(address,))
+                    process.daemon = True
+                    process.start()
+                    rospy.loginfo("Launched startSocketServer")
+                else:
+                    rospy.loginfo("Calling startSerialClient")
+                    self.startSerialClient()
+                    rospy.loginfo("startSerialClient() exited")
+            except socket.timeout:
+                self.isConnected = False
+                self.client_address = None
+                continue
+
+    def startSerialClient(self):
+        client = SerialClient(self)
+        try:
+            client.run()
+        except KeyboardInterrupt as e:
+            rospy.loginfo(f"{e}")
+        except RuntimeError:
+            rospy.loginfo("RuntimeError exception caught")
+            self.isConnected = False
+            self.client_address = None
+        finally:
+            rospy.loginfo("Client has exited.")
+
+    def startSocketServer(self, address):
+        rospy.loginfo("Starting ROS Serial Python Node serial_node-%r" % address)
+        rospy.init_node("serial_node_%r" % address)
+        self.startSerialClient()
+
+    def flushInput(self):
+        self.recv_buffer  = b''
+
+    def write(self, data):
+        if not self.isConnected or self.client_address is None:
+            return
+
+        total_length = len(data)
+        offset = 0
+
+        while offset < total_length:
+            # Determine the size of the next chunk
+            chunk_size = min(MAX_UDP_PACKET_SIZE, total_length - offset)
+            chunk = data[offset:offset + chunk_size]
+            
+            try:
+                # Send the chunk to the stored client address
+                self.serversocket.sendto(chunk, self.client_address)
+                offset += chunk_size
+            except BrokenPipeError:
+                raise RuntimeError("RosSerialServerUDP.write() socket connection broken")
+
+    def read(self, rqsted_length):
+        self.msg = b''  # Buffer to accumulate the received message
+
+        if not self.isConnected or self.client_address is None:
+            return self.msg  # Return an empty message if not connected
+
+        # First, try to use any leftover data in the internal buffer
+        if self.recv_buffer:
+            # Calculate how much data can be used from the buffer
+            to_read = min(len(self.recv_buffer), rqsted_length)
+            self.msg += self.recv_buffer[:to_read]
+            self.recv_buffer = self.recv_buffer[to_read:]
+
+        while len(self.msg) < rqsted_length:
+            chunk, address = self.serversocket.recvfrom(4096)
+
+            # Check if the connection is broken
+            if chunk == b'':
+                raise RuntimeError("RosSerialServer.read() socket connection broken")
+
+            
+            # Check if data is coming from the client address
+            if address != self.client_address:
+                # If data comes from the same IP but different port, update the client_address
+                if address[0] == self.client_address[0]:
+                    rospy.logwarn(f"Updating client address from {self.client_address} to {address}")
+                    self.client_address = address
+                else:
+                    rospy.loginfo(f"Ignoring packet from unauthorized address {address}")
+                    continue
+
+            
+            # Determine how much of the chunk can be added to `self.msg`
+            to_add = rqsted_length - len(self.msg)
+            self.msg += chunk[:to_add]
+
+            # Store any remaining data from the chunk in the internal buffer
+            if len(chunk) > to_add:
+                self.recv_buffer += chunk[to_add:]
+
+        return self.msg
+
+    def inWaiting(self):
+        try:
+            chunk, address = self.serversocket.recvfrom(4096, socket.MSG_DONTWAIT)
+            if chunk == b'':
+                raise RuntimeError("RosSerialServerUDP.inWaiting() socket connection broken")
+
+            # Check if data is coming from the client address
+            if address != self.client_address:
+                # If data comes from the same IP but different port, update the client_address
+                if address[0] == self.client_address[0]:
+                    rospy.logwarn(f"Updating client address from {self.client_address} to {address}")
+                    self.client_address = address
+                else:
+                    rospy.loginfo(f"Ignoring packet from unauthorized address {address}")
+
+            self.recv_buffer += chunk
+        except BlockingIOError:
+            pass
+
+        return len(self.recv_buffer)
+
+
 class SerialClient(object):
     """
         ServiceServer responds to requests from the serial device.
@@ -589,23 +756,7 @@ class SerialClient(object):
             except IOError as exc:
                 rospy.logwarn('Last read step: %s' % read_step)
                 rospy.logwarn('Run loop error: %s' % exc)
-                # One of the read calls had an issue. Just to be safe, request that the client
-                # reinitialize their topics.
-                with acquire_timeout(self.read_lock, 1) as res:
-                    if res:
-                        try:
-                            self.port.flushInput()
-                        except AttributeError: # socket doesn't have flushInput
-                            pass
-
-                with acquire_timeout(self.write_lock, 1) as res:
-                    if res:
-                        try:
-                            self.port.flushOutput()
-                        except AttributeError: # socket doesn't have flushOutput
-                            pass
-                    
-                self.requestTopics()
+                return
         self.write_thread.join()
 
     def setPublishSize(self, size):
