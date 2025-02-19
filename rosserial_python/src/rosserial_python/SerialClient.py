@@ -354,11 +354,14 @@ class RosSerialUDPServer:
         uses it as a serial port. It listens for additional packets. Each process proxies ROS
         operations (e.g. publish/subscribe) from its connection to the rest of ROS.
     """
-    def __init__(self, udp_portnum, fork_server=False):
+    def __init__(self, udp_portnum, fork_server=False, diagnostics_status_name=None):
         rospy.loginfo("Fork_server is: %s" % fork_server)
         self.udp_portnum = udp_portnum
         self.fork_server = fork_server
         self.recv_buffer  = b'' # Buffer to store leftover data from packets
+        self.status_name = diagnostics_status_name
+        
+        self.pub_diagnostics = rospy.Publisher('/diagnostics', diagnostic_msgs.msg.DiagnosticArray, queue_size=10)
 
     def listen(self):
         self.serversocket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -404,9 +407,15 @@ class RosSerialUDPServer:
                     rospy.loginfo("Calling startSerialClient")
                     self.startSerialClient()
                     rospy.loginfo("startSerialClient() exited")
+
+                if self.isConnected:
+                    self.sendDiagnostics(diagnostic_msgs.msg.DiagnosticStatus.OK, "Connection established")
+                else:
+                    self.sendDiagnostics(diagnostic_msgs.msg.DiagnosticStatus.WARN, "Waiting for connection")
             except socket.timeout:
                 self.isConnected = False
                 self.client_address = None
+                self.sendDiagnostics(diagnostic_msgs.msg.DiagnosticStatus.ERROR, "Connection timed out")
                 continue
 
     def startSerialClient(self):
@@ -512,6 +521,32 @@ class RosSerialUDPServer:
 
         return len(self.recv_buffer)
 
+    def sendDiagnostics(self, level, msg_text):
+        msg = diagnostic_msgs.msg.DiagnosticArray()
+        status = diagnostic_msgs.msg.DiagnosticStatus()
+        if self.status is None:
+            status.name = "rosserial/udp_server"
+        else:
+            status.name = self.status_name
+        msg.header.stamp = rospy.Time.now()
+        msg.status.append(status)
+
+        status.message = msg_text
+        status.level = level
+
+        status.values.append(diagnostic_msgs.msg.KeyValue())
+        status.values[0].key = "UDP Port"
+        status.values[0].value = str(self.udp_portnum)
+
+        status.values.append(diagnostic_msgs.msg.KeyValue())
+        status.values[1].key = "Client Address"
+        status.values[1].value = str(self.client_address) if self.client_address else "No client connected"
+
+        status.values.append(diagnostic_msgs.msg.KeyValue())
+        status.values[2].key = "Is Connected"
+        status.values[2].value = "Yes" if self.isConnected else "No"
+
+        self.pub_diagnostics.publish(msg)
 
 class SerialClient(object):
     """
