@@ -524,7 +524,7 @@ class RosSerialUDPServer:
     def sendDiagnostics(self, level, msg_text):
         msg = diagnostic_msgs.msg.DiagnosticArray()
         status = diagnostic_msgs.msg.DiagnosticStatus()
-        if self.status is None:
+        if self.status_name is None:
             status.name = "rosserial/udp_server"
         else:
             status.name = self.status_name
