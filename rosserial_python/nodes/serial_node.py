@@ -49,7 +49,6 @@ if __name__=="__main__":
 
     port_name = rospy.get_param('~port','/dev/ttyUSB0')
     baud = int(rospy.get_param('~baud','57600'))
-    diagnostics_status_name = rospy.get_param('~diagnostics_status_name', None)
 
     # for systems where pyserial yields errors in the fcntl.ioctl(self.fd, TIOCMBIS, \
     # TIOCM_DTR_str) line, which causes an IOError, when using simulated port
@@ -81,7 +80,7 @@ if __name__=="__main__":
                 process.join()
             rospy.loginfo("All done")
     elif port_name == "udp" :
-        server = RosSerialUDPServer(tcp_portnum, fork_server, diagnostics_status_name)
+        server = RosSerialUDPServer(tcp_portnum, fork_server)
         rospy.loginfo("Waiting for socket connections on port %d" % tcp_portnum)
         try:
             server.listen()
