@@ -63,6 +63,7 @@ ERROR_CONNECTION_LOST = "Connection lost. Waiting for a new connection."
 ERROR_CONNECTION_INTERRUPTED = "Connection interrupted. Waiting for a new connection."
 ERROR_RUNTIME_OCCURRED = "Runtime error occurred. Waiting for a new connection."
 ERROR_CLIENT_EXITED = "Client has exited. Waiting for a new connection."
+TIMEOUT_HAS_OCCOUR = "Socket timeout. Waiting for a new connection."
 CONNECTION_IS_OK = "Connection established"
 WAITING_FOR_CONNECTION = "Waiting for connection"
 
@@ -415,7 +416,7 @@ class RosSerialUDPServer:
                     self.startSerialClient()
                     rospy.loginfo("startSerialClient() exited")
             except socket.timeout:
-                self.sendDiagnostics(diagnostic_msgs.msg.DiagnosticStatus.ERROR, WAITING_FOR_CONNECTION)
+                self.sendDiagnostics(diagnostic_msgs.msg.DiagnosticStatus.ERROR, TIMEOUT_HAS_OCCOUR)
                 self.isConnected = False
                 self.client_address = None
                 continue
@@ -528,7 +529,19 @@ class RosSerialUDPServer:
 
         return len(self.recv_buffer)
     
+    def _check_diagnostics_send_time(self, level):
+        if getattr(self, "_level", None) is not None:
+            if getattr(self, "_send_time", None) is not None:
+                if level == self._level:
+                    now = rospy.Time.now()
+                    if (now - self._send_time).to_sec() < 1.0: # send every 1 second
+                        return False
+        return True
+    
     def sendDiagnostics(self, level, msg_text):
+        if not self._check_diagnostics_send_time(level):
+            return
+        
         msg = diagnostic_msgs.msg.DiagnosticArray()
         status = diagnostic_msgs.msg.DiagnosticStatus()
         status.name = "Rosserial Connection Status"
@@ -546,7 +559,9 @@ class RosSerialUDPServer:
         status.values.append(diagnostic_msgs.msg.KeyValue())
         status.values[1].key = "UDP Connection Status"
         status.values[1].value = "Connected" if level == diagnostic_msgs.msg.DiagnosticStatus.OK else "Not connected"
-
+        
+        self._level=level
+        self._send_time = msg.header.stamp
         self.pub_diagnostics.publish(msg)
 
 
@@ -1060,8 +1075,19 @@ class SerialClient(object):
                         rospy.logerr('Write thread exception: %s' % exc)
                         break
 
-
+    def _check_diagnostics_send_time(self, level):
+        if getattr(self, "_level", None) is not None:
+            if getattr(self, "_send_time", None) is not None:
+                if level == self._level:
+                    now = rospy.Time.now()
+                    if (now - self._send_time).to_sec() < 1.0: # send every 1 second
+                        return False
+        return True
+    
     def sendDiagnostics(self, level, msg_text):
+        
+        if not self._check_diagnostics_send_time(level):
+            return
         msg = diagnostic_msgs.msg.DiagnosticArray()
         status = diagnostic_msgs.msg.DiagnosticStatus()
         status.name = "Rosserial Connection Status"
@@ -1081,5 +1107,7 @@ class SerialClient(object):
         status.values.append(diagnostic_msgs.msg.KeyValue())
         status.values[1].key="last sync lost"
         status.values[1].value=time.ctime(self.lastsync_lost.to_sec())
-
+        
+        self._level=level
+        self._send_time = msg.header.stamp
         self.pub_diagnostics.publish(msg)
