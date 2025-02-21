@@ -59,8 +59,16 @@ import diagnostic_msgs.msg
 ERROR_MISMATCHED_PROTOCOL = "Mismatched protocol version in packet: lost sync or rosserial_python is from different ros release than the rosserial client"
 ERROR_NO_SYNC = "no sync with device"
 ERROR_PACKET_FAILED = "Packet Failed : Failed to read msg data"
+ERROR_CONNECTION_LOST = "Connection lost. Waiting for a new connection."
+ERROR_CONNECTION_INTERRUPTED = "Connection interrupted. Waiting for a new connection."
+ERROR_RUNTIME_OCCURRED = "Runtime error occurred. Waiting for a new connection."
+ERROR_CLIENT_EXITED = "Client has exited. Waiting for a new connection."
+CONNECTION_IS_OK = "Connection established"
+WAITING_FOR_CONNECTION = "Waiting for connection"
 
 MAX_UDP_PACKET_SIZE = 508
+
+
 
 def load_pkg_module(package, directory):
     #check if its in the python path
@@ -359,6 +367,7 @@ class RosSerialUDPServer:
         self.udp_portnum = udp_portnum
         self.fork_server = fork_server
         self.recv_buffer  = b'' # Buffer to store leftover data from packets
+        self.pub_diagnostics = rospy.Publisher('/diagnostics', diagnostic_msgs.msg.DiagnosticArray, queue_size=10)
 
     def listen(self):
         self.serversocket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -401,25 +410,32 @@ class RosSerialUDPServer:
                     process.start()
                     rospy.loginfo("Launched startSocketServer")
                 else:
+                    self.sendDiagnostics(diagnostic_msgs.msg.DiagnosticStatus.ERROR, WAITING_FOR_CONNECTION)
                     rospy.loginfo("Calling startSerialClient")
                     self.startSerialClient()
                     rospy.loginfo("startSerialClient() exited")
             except socket.timeout:
+                self.sendDiagnostics(diagnostic_msgs.msg.DiagnosticStatus.ERROR, WAITING_FOR_CONNECTION)
                 self.isConnected = False
                 self.client_address = None
                 continue
+            if not self.isConnected:
+                self.sendDiagnostics(diagnostic_msgs.msg.DiagnosticStatus.ERROR, ERROR_CONNECTION_LOST)
 
     def startSerialClient(self):
         client = SerialClient(self)
         try:
             client.run()
         except KeyboardInterrupt as e:
+            self.sendDiagnostics(diagnostic_msgs.msg.DiagnosticStatus.ERROR, ERROR_CONNECTION_INTERRUPTED)
             rospy.loginfo(f"{e}")
         except RuntimeError:
+            self.sendDiagnostics(diagnostic_msgs.msg.DiagnosticStatus.ERROR, ERROR_RUNTIME_OCCURRED)
             rospy.loginfo("RuntimeError exception caught")
             self.isConnected = False
             self.client_address = None
         finally:
+            self.sendDiagnostics(diagnostic_msgs.msg.DiagnosticStatus.ERROR, ERROR_CLIENT_EXITED)
             rospy.loginfo("Client has exited.")
 
     def startSocketServer(self, address):
@@ -511,6 +527,27 @@ class RosSerialUDPServer:
             pass
 
         return len(self.recv_buffer)
+    
+    def sendDiagnostics(self, level, msg_text):
+        msg = diagnostic_msgs.msg.DiagnosticArray()
+        status = diagnostic_msgs.msg.DiagnosticStatus()
+        status.name = "Rosserial Connection Status"
+        msg.header.stamp = rospy.Time.now()
+        msg.status.append(status)
+
+        status.message = msg_text
+        status.level = level
+
+        # UPD INFO
+        status.values.append(diagnostic_msgs.msg.KeyValue())
+        status.values[0].key = "UDP Client Address"
+        status.values[0].value = str(self.client_address) if self.client_address else "Not connected"
+
+        status.values.append(diagnostic_msgs.msg.KeyValue())
+        status.values[1].key = "UDP Connection Status"
+        status.values[1].value = "Connected" if level == diagnostic_msgs.msg.DiagnosticStatus.OK else "Not connected"
+
+        self.pub_diagnostics.publish(msg)
 
 
 class SerialClient(object):
@@ -670,6 +707,9 @@ class SerialClient(object):
                 self.sendDiagnostics(diagnostic_msgs.msg.DiagnosticStatus.ERROR, ERROR_NO_SYNC)
                 self.requestTopics()
                 self.lastsync = rospy.Time.now()
+            else:
+                if self.synced:
+                    self.sendDiagnostics(diagnostic_msgs.msg.DiagnosticStatus.OK, CONNECTION_IS_OK)
 
             # This try-block is here because we make multiple calls to read(). Any one of them can throw
             # an IOError if there's a serial problem or timeout. In that scenario, a single handler at the
@@ -1024,7 +1064,7 @@ class SerialClient(object):
     def sendDiagnostics(self, level, msg_text):
         msg = diagnostic_msgs.msg.DiagnosticArray()
         status = diagnostic_msgs.msg.DiagnosticStatus()
-        status.name = "rosserial_python"
+        status.name = "Rosserial Connection Status"
         msg.header.stamp = rospy.Time.now()
         msg.status.append(status)
 
