@@ -369,6 +369,7 @@ class RosSerialUDPServer:
         self.fork_server = fork_server
         self.recv_buffer  = b'' # Buffer to store leftover data from packets
         self.pub_diagnostics = rospy.Publisher('/diagnostics', diagnostic_msgs.msg.DiagnosticArray, queue_size=10)
+        self.serversocket = None
 
     def listen(self):
         self.serversocket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -437,6 +438,14 @@ class RosSerialUDPServer:
             self.client_address = None
         finally:
             self.sendDiagnostics(diagnostic_msgs.msg.DiagnosticStatus.ERROR, ERROR_CLIENT_EXITED)
+            # unregister all subscribers and services
+            rospy.loginfo("Unregistering all subscribers and services")
+            for sub in client.subscribers.values():
+                sub.unregister()
+            for srv in client.services.values():
+                srv.unregister()
+            if self.serversocket:
+                self.serversocket.close()
             rospy.loginfo("Client has exited.")
 
     def startSocketServer(self, address):
@@ -1034,7 +1043,7 @@ class SerialClient(object):
         """
         length = len(msg_bytes)
         if self.buffer_in > 0 and length > self.buffer_in:
-            rospy.logerr("Message from ROS network dropped: message larger than buffer.\n%s" % msg)
+            rospy.logerr("Message from ROS network dropped: message larger than buffer.\n%s" % msg_bytes)
             return -1
         else:
             # frame : header (1b) + version (1b) + msg_len(2b) + msg_len_chk(1b) + topic_id(2b) + msg(nb) + msg_topic_id_chk(1b)
