@@ -109,6 +109,40 @@ def acquire_timeout(lock, timeout):
             lock.release()
 
 
+class _DeferredPacketHandler:
+    """Queues device packets until the real rospy publisher/service is ready.
+
+    Topic setup (import + rospy.Publisher) is too slow to run on the read
+    loop: it stalls get_param replies behind ~150 TopicInfo frames. This
+    handler is installed immediately so later data is not dropped and does
+    not trigger 'Tried to publish before configured' / requestTopics()
+    (rosserial #299 / #308).
+    """
+    _MAX_QUEUED = 128
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._queue = []
+        self._handler = None
+
+    def handlePacket(self, data):
+        with self._lock:
+            if self._handler is None:
+                if len(self._queue) < self._MAX_QUEUED:
+                    self._queue.append(data)
+                return
+            handler = self._handler
+        handler(data)
+
+    def attach(self, handler):
+        with self._lock:
+            self._handler = handler
+            queued = self._queue
+            self._queue = []
+        for data in queued:
+            handler(data)
+
+
 class Publisher:
     """
         Publisher forwards messages from the serial device to ROS.
@@ -607,6 +641,14 @@ class SerialClient(object):
         self.publishers = dict()  # id:Publishers
         self.subscribers = dict() # topic:Subscriber
         self.services = dict()    # topic:Service
+
+        # Expensive rospy.Publisher/Subscriber construction runs on a worker,
+        # not on the UDP/serial read loop (otherwise get_param times out during
+        # negotiate). Same process, after init_node — rospy XMLRPC is used
+        # from the write thread already (rosserial #351).
+        self._topic_setup_queue = queue.Queue()
+        self._deferred_handlers = dict()  # topic_id: _DeferredPacketHandler
+        self._topic_setup_thread = None
         
         def shutdown():
             self.txStopRequest()
@@ -717,6 +759,13 @@ class SerialClient(object):
             self.write_thread.daemon = True
             self.write_thread.start()
 
+        if self._topic_setup_thread is None:
+            self._topic_setup_thread = threading.Thread(
+                target=self._processTopicSetupQueue,
+                name="rosserial_topic_setup")
+            self._topic_setup_thread.daemon = True
+            self._topic_setup_thread.start()
+
         # Handle reading.
         data = ''
         read_step = None
@@ -811,9 +860,14 @@ class SerialClient(object):
                     try:
                         self.callbacks[topic_id](msg)
                     except KeyError:
-                        rospy.logerr("Tried to publish before configured, topic id %d" % topic_id)
-                        self.requestTopics()
-                    time.sleep(0.001)
+                        # Data beat TopicInfo (or setup is still queued). Queue
+                        # the payload instead of requestTopics(), which storms
+                        # renegotiate (rosserial #299 / #308).
+                        rospy.logwarn_throttle(
+                            5.0,
+                            "Tried to publish before configured, topic id %d" % topic_id)
+                        self._installDeferredHandler(topic_id)
+                        self.callbacks[topic_id](msg)
                 else:
                     rospy.loginfo("wrong checksum for topic id and msg")
 
@@ -833,40 +887,81 @@ class SerialClient(object):
             self.buffer_in = size
             rospy.loginfo("Note: subscribe buffer size is %d bytes" % self.buffer_in)
 
+    def _installDeferredHandler(self, topic_id):
+        """Accept packets for topic_id immediately; flush them after real setup."""
+        if topic_id in self.callbacks:
+            return
+        pending = _DeferredPacketHandler()
+        self._deferred_handlers[topic_id] = pending
+        self.callbacks[topic_id] = pending.handlePacket
+
+    def _attachHandler(self, topic_id, handler):
+        pending = self._deferred_handlers.pop(topic_id, None)
+        if pending is not None:
+            pending.attach(handler)
+        self.callbacks[topic_id] = handler
+
+    def _processTopicSetupQueue(self):
+        while not rospy.is_shutdown():
+            try:
+                kind, msg = self._topic_setup_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            try:
+                if kind == 'publisher':
+                    self._finishSetupPublisher(msg)
+                elif kind == 'subscriber':
+                    self._finishSetupSubscriber(msg)
+                elif kind == 'service_server_publisher':
+                    self._finishSetupServiceServerPublisher(msg)
+                elif kind == 'service_server_subscriber':
+                    self._finishSetupServiceServerSubscriber(msg)
+                elif kind == 'service_client_publisher':
+                    self._finishSetupServiceClientPublisher(msg)
+                elif kind == 'service_client_subscriber':
+                    self._finishSetupServiceClientSubscriber(msg)
+            except Exception as e:
+                rospy.logerr("Deferred topic setup (%s) failed: %s", kind, e)
+
     def setupPublisher(self, data):
-        """ Register a new publisher. """
+        """Register a new publisher. rospy.Publisher is created off the read loop."""
         try:
             msg = TopicInfo()
             msg.deserialize(data)
-            pub = Publisher(msg)
-            if msg.topic_id not in self.publishers:
-                rospy.loginfo("Setup publisher on %s [%s]" % (msg.topic_name, msg.message_type) )
-            self.publishers[msg.topic_id] = pub
-            self.callbacks[msg.topic_id] = pub.handlePacket
             self.setPublishSize(msg.buffer_size)
-            
+            self._installDeferredHandler(msg.topic_id)
+            self._topic_setup_queue.put(('publisher', msg))
         except Exception as e:
             rospy.logerr("Creation of publisher failed: %s", e)
 
+    def _finishSetupPublisher(self, msg):
+        pub = Publisher(msg)
+        if msg.topic_id not in self.publishers:
+            rospy.loginfo("Setup publisher on %s [%s]" % (msg.topic_name, msg.message_type))
+        self.publishers[msg.topic_id] = pub
+        self._attachHandler(msg.topic_id, pub.handlePacket)
+
     def setupSubscriber(self, data):
-        """ Register a new subscriber. """
+        """Register a new subscriber. rospy.Subscriber is created off the read loop."""
         try:
             msg = TopicInfo()
             msg.deserialize(data)
-            if not msg.topic_name in list(self.subscribers.keys()):
-                sub = Subscriber(msg, self)
-                self.subscribers[msg.topic_name] = sub
-                self.setSubscribeSize(msg.buffer_size)
-                rospy.loginfo("Setup subscriber on %s [%s]" % (msg.topic_name, msg.message_type) )
-            elif msg.message_type != self.subscribers[msg.topic_name].message._type:
-                old_message_type = self.subscribers[msg.topic_name].message._type
-                self.subscribers[msg.topic_name].unregister()
-                sub = Subscriber(msg, self)
-                self.subscribers[msg.topic_name] = sub
-                self.setSubscribeSize(msg.buffer_size)
-                rospy.loginfo("Change the message type of subscriber on %s from [%s] to [%s]" % (msg.topic_name, old_message_type, msg.message_type) )
+            self.setSubscribeSize(msg.buffer_size)
+            self._topic_setup_queue.put(('subscriber', msg))
         except Exception as e:
             rospy.logerr("Creation of subscriber failed: %s", e)
+
+    def _finishSetupSubscriber(self, msg):
+        if not msg.topic_name in list(self.subscribers.keys()):
+            sub = Subscriber(msg, self)
+            self.subscribers[msg.topic_name] = sub
+            rospy.loginfo("Setup subscriber on %s [%s]" % (msg.topic_name, msg.message_type))
+        elif msg.message_type != self.subscribers[msg.topic_name].message._type:
+            old_message_type = self.subscribers[msg.topic_name].message._type
+            self.subscribers[msg.topic_name].unregister()
+            sub = Subscriber(msg, self)
+            self.subscribers[msg.topic_name] = sub
+            rospy.loginfo("Change the message type of subscriber on %s from [%s] to [%s]" % (msg.topic_name, old_message_type, msg.message_type))
 
     def setupServiceServerPublisher(self, data):
         """ Register a new service server. """
@@ -874,18 +969,22 @@ class SerialClient(object):
             msg = TopicInfo()
             msg.deserialize(data)
             self.setPublishSize(msg.buffer_size)
-            try:
-                srv = self.services[msg.topic_name]
-            except KeyError:
-                srv = ServiceServer(msg, self)
-                rospy.loginfo("Setup service server on %s [%s]" % (msg.topic_name, msg.message_type) )
-                self.services[msg.topic_name] = srv
-            if srv.mres._md5sum == msg.md5sum:
-                self.callbacks[msg.topic_id] = srv.handlePacket
-            else:
-                raise Exception('Checksum does not match: ' + srv.mres._md5sum + ',' + msg.md5sum)
+            self._installDeferredHandler(msg.topic_id)
+            self._topic_setup_queue.put(('service_server_publisher', msg))
         except Exception as e:
             rospy.logerr("Creation of service server failed: %s", e)
+
+    def _finishSetupServiceServerPublisher(self, msg):
+        try:
+            srv = self.services[msg.topic_name]
+        except KeyError:
+            srv = ServiceServer(msg, self)
+            rospy.loginfo("Setup service server on %s [%s]" % (msg.topic_name, msg.message_type))
+            self.services[msg.topic_name] = srv
+        if srv.mres._md5sum == msg.md5sum:
+            self._attachHandler(msg.topic_id, srv.handlePacket)
+        else:
+            raise Exception('Checksum does not match: ' + srv.mres._md5sum + ',' + msg.md5sum)
 
     def setupServiceServerSubscriber(self, data):
         """ Register a new service server. """
@@ -893,18 +992,21 @@ class SerialClient(object):
             msg = TopicInfo()
             msg.deserialize(data)
             self.setSubscribeSize(msg.buffer_size)
-            try:
-                srv = self.services[msg.topic_name]
-            except KeyError:
-                srv = ServiceServer(msg, self)
-                rospy.loginfo("Setup service server on %s [%s]" % (msg.topic_name, msg.message_type) )
-                self.services[msg.topic_name] = srv
-            if srv.mreq._md5sum == msg.md5sum:
-                srv.id = msg.topic_id
-            else:
-                raise Exception('Checksum does not match: ' + srv.mreq._md5sum + ',' + msg.md5sum)
+            self._topic_setup_queue.put(('service_server_subscriber', msg))
         except Exception as e:
             rospy.logerr("Creation of service server failed: %s", e)
+
+    def _finishSetupServiceServerSubscriber(self, msg):
+        try:
+            srv = self.services[msg.topic_name]
+        except KeyError:
+            srv = ServiceServer(msg, self)
+            rospy.loginfo("Setup service server on %s [%s]" % (msg.topic_name, msg.message_type))
+            self.services[msg.topic_name] = srv
+        if srv.mreq._md5sum == msg.md5sum:
+            srv.id = msg.topic_id
+        else:
+            raise Exception('Checksum does not match: ' + srv.mreq._md5sum + ',' + msg.md5sum)
 
     def setupServiceClientPublisher(self, data):
         """ Register a new service client. """
@@ -912,18 +1014,22 @@ class SerialClient(object):
             msg = TopicInfo()
             msg.deserialize(data)
             self.setPublishSize(msg.buffer_size)
-            try:
-                srv = self.services[msg.topic_name]
-            except KeyError:
-                srv = ServiceClient(msg, self)
-                rospy.loginfo("Setup service client on %s [%s]" % (msg.topic_name, msg.message_type) )
-                self.services[msg.topic_name] = srv
-            if srv.mreq._md5sum == msg.md5sum:
-                self.callbacks[msg.topic_id] = srv.handlePacket
-            else:
-                raise Exception('Checksum does not match: ' + srv.mreq._md5sum + ',' + msg.md5sum)
+            self._installDeferredHandler(msg.topic_id)
+            self._topic_setup_queue.put(('service_client_publisher', msg))
         except Exception as e:
             rospy.logerr("Creation of service client failed: %s", e)
+
+    def _finishSetupServiceClientPublisher(self, msg):
+        try:
+            srv = self.services[msg.topic_name]
+        except KeyError:
+            srv = ServiceClient(msg, self)
+            rospy.loginfo("Setup service client on %s [%s]" % (msg.topic_name, msg.message_type))
+            self.services[msg.topic_name] = srv
+        if srv.mreq._md5sum == msg.md5sum:
+            self._attachHandler(msg.topic_id, srv.handlePacket)
+        else:
+            raise Exception('Checksum does not match: ' + srv.mreq._md5sum + ',' + msg.md5sum)
 
     def setupServiceClientSubscriber(self, data):
         """ Register a new service client. """
@@ -931,18 +1037,21 @@ class SerialClient(object):
             msg = TopicInfo()
             msg.deserialize(data)
             self.setSubscribeSize(msg.buffer_size)
-            try:
-                srv = self.services[msg.topic_name]
-            except KeyError:
-                srv = ServiceClient(msg, self)
-                rospy.loginfo("Setup service client on %s [%s]" % (msg.topic_name, msg.message_type) )
-                self.services[msg.topic_name] = srv
-            if srv.mres._md5sum == msg.md5sum:
-                srv.id = msg.topic_id
-            else:
-                raise Exception('Checksum does not match: ' + srv.mres._md5sum + ',' + msg.md5sum)
+            self._topic_setup_queue.put(('service_client_subscriber', msg))
         except Exception as e:
             rospy.logerr("Creation of service client failed: %s", e)
+
+    def _finishSetupServiceClientSubscriber(self, msg):
+        try:
+            srv = self.services[msg.topic_name]
+        except KeyError:
+            srv = ServiceClient(msg, self)
+            rospy.loginfo("Setup service client on %s [%s]" % (msg.topic_name, msg.message_type))
+            self.services[msg.topic_name] = srv
+        if srv.mres._md5sum == msg.md5sum:
+            srv.id = msg.topic_id
+        else:
+            raise Exception('Checksum does not match: ' + srv.mres._md5sum + ',' + msg.md5sum)
 
     def handleTimeRequest(self, data):
         """ Respond to device with system time. """
